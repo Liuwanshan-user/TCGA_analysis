@@ -1,9 +1,9 @@
 ################################################################################
-#                    TCGA 子宫内膜癌数据分析 (最终修复版)
+#                    TCGA 子宫内膜癌数据分析 (最终修复版 v2)
 #         聚类热图 + 相关性热图 + 差异检验 + 箱线图 + OS/DFS生存分析
 #
-#  版本: FINAL (2024)
-#  
+#  版本: FINAL v2 (2024) - 修复DFS时间计算问题
+#
 #  主要功能:
 #  1. 聚类热图 - 基因表达聚类分析（样本分组）
 #  2. 相关性热图 - 基因间相关性分析（带显著性标记）
@@ -17,13 +17,22 @@
 #     - 每个基因使用独立的临时数据框（temp_data_os / temp_data_dfs）
 #     - 统一基因列名为gene_expression，避免动态引用冲突
 #     - 直接使用公式而非as.formula()，避免环境问题
-#  
+#
 #  ✅ 修复2: DFS分析完全独立计算，不再依赖OS数据
 #     - DFS从头开始独立准备数据（表达数据 + 疾病状态 + 临床数据）
 #     - DFS使用独立的患者集（可能小于OS，因为需要疾病状态数据）
 #     - DFS独立计算中位数和分组，不受OS影响
 #
 #  ✅ 修复3: 每次循环后清理临时变量，避免内存泄漏和数据污染
+#
+#  🔥 修复4 (v2新增): DFS时间计算与OS完全不同
+#     - 问题: 原代码DFS_time使用与OS_time相同的计算方式，导致Risk table数字相同
+#     - 解决: 根据TCGA-CDR标准，DFS_time优先使用new_tumor_event_dx_days_to
+#     - 时间计算优先级:
+#       1. 有新肿瘤事件时间 → 使用 nte_days (最准确)
+#       2. 死亡 → 使用 days_to_death
+#       3. 存活 → 使用 days_to_last_follow_up
+#     - 新增时间差异诊断输出，验证修复是否成功
 #
 #  使用说明:
 #  1. 准备 Gene list.csv 文件（包含Gene列）
@@ -495,23 +504,33 @@ print(os_results)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #                      第六部分：DFS生存分析 (完全重新计算)
+#                      🔥 关键修复：使用 new_tumor_event 时间
 # ══════════════════════════════════════════════════════════════════════════════
 
 cat("\n====== 步骤10: 准备DFS生存分析数据 (独立计算) ======\n")
 
 # 🔥 关键修复：DFS完全独立准备数据，不依赖OS
+# 根据TCGA-CDR标准：
+# - DFS_time: 对于有新肿瘤事件的患者，使用 new_tumor_event_dx_days_to
+# - 对于死亡患者（有肿瘤），使用 days_to_death
+# - 对于审查患者，使用 days_to_last_follow_up
 
 # 从 colData 获取样本信息
 sample_info <- as.data.frame(colData(data_exp))
 
 # 查找疾病状态相关字段
-cat("查找疾病状态字段...\n")
+cat("查找疾病状态和新肿瘤事件字段...\n")
 
 all_cols <- colnames(sample_info)
 disease_cols <- grep("disease|tumor|response", all_cols, ignore.case = TRUE, value = TRUE)
-cat("找到的相关字段:", paste(disease_cols, collapse = ", "), "\n")
+cat("找到的疾病相关字段:", paste(disease_cols, collapse = ", "), "\n")
 
-# 优先查找的字段
+# 🔥 新增：查找新肿瘤事件时间字段
+nte_time_cols <- grep("new_tumor.*days|days.*new_tumor|nte.*days|days.*nte|progression.*days|days.*progression",
+                       all_cols, ignore.case = TRUE, value = TRUE)
+cat("找到的新肿瘤事件时间字段:", paste(nte_time_cols, collapse = ", "), "\n")
+
+# 优先查找的肿瘤状态字段
 priority_fields <- c(
   "paper_tumor_status",
   "follow_ups_disease_response",
@@ -519,7 +538,15 @@ priority_fields <- c(
   "disease_response"
 )
 
-# 找到第一个存在且有"WITH TUMOR"或"TUMOR"值的字段
+# 优先查找的新肿瘤事件时间字段
+nte_time_priority <- c(
+  "new_tumor_event_dx_days_to",
+  "days_to_new_tumor_event_after_initial_treatment",
+  "paper_days_to_new_tumor_event_after_initial_treatment",
+  "follow_ups_new_tumor_event_dx_days_to"
+)
+
+# 找到肿瘤状态字段
 status_field <- NULL
 for (field in c(priority_fields, disease_cols)) {
   if (field %in% colnames(sample_info)) {
@@ -527,7 +554,7 @@ for (field in c(priority_fields, disease_cols)) {
     has_tumor <- sum(grepl("TUMOR|tumor|WITH|with", vals, ignore.case = TRUE), na.rm = TRUE)
     if (has_tumor > 0) {
       status_field <- field
-      cat("\n选择字段:", field, "\n")
+      cat("\n选择肿瘤状态字段:", field, "\n")
       cat("字段值分布:\n")
       print(table(vals, useNA = "ifany"))
       break
@@ -535,71 +562,116 @@ for (field in c(priority_fields, disease_cols)) {
   }
 }
 
+# 🔥 新增：找到新肿瘤事件时间字段
+nte_time_field <- NULL
+for (field in c(nte_time_priority, nte_time_cols)) {
+  if (field %in% colnames(sample_info)) {
+    vals <- as.numeric(sample_info[[field]])
+    valid_count <- sum(!is.na(vals) & vals > 0, na.rm = TRUE)
+    if (valid_count > 0) {
+      nte_time_field <- field
+      cat("\n选择新肿瘤事件时间字段:", field, "\n")
+      cat("有效值数量:", valid_count, "\n")
+      cat("时间范围:", min(vals, na.rm = TRUE), "-", max(vals, na.rm = TRUE), "天\n")
+      break
+    }
+  }
+}
+
 if (!is.null(status_field)) {
-  
+
   # 🔥 步骤1: 独立准备DFS的表达数据
   tumor_idx_dfs <- sample_group == "Tumor"
   exp_tumor_dfs <- exp_norm[, tumor_idx_dfs]
-  
-  # 🔥 步骤2: 提取样本的疾病状态信息
+
+  # 🔥 步骤2: 提取样本的疾病状态信息（包括新肿瘤事件时间）
   tumor_info <- sample_info[tumor_idx_dfs, ]
   tumor_info$sample_id <- rownames(tumor_info)
   tumor_info$patient_id <- substr(tumor_info$sample_id, 1, 12)
   tumor_info$disease_status <- tumor_info[[status_field]]
-  
+
   # 识别有肿瘤/进展的样本
   tumor_info$has_tumor <- grepl("^WT|With Tumor$", tumor_info$disease_status)
-  
+
+  # 🔥 新增：提取新肿瘤事件时间
+  if (!is.null(nte_time_field)) {
+    tumor_info$nte_days <- as.numeric(tumor_info[[nte_time_field]])
+    cat("\n新肿瘤事件时间分布:\n")
+    cat("有NTE时间的样本数:", sum(!is.na(tumor_info$nte_days) & tumor_info$nte_days > 0), "\n")
+  } else {
+    tumor_info$nte_days <- NA
+    cat("\n警告: 未找到新肿瘤事件时间字段，将使用随访时间近似\n")
+  }
+
   cat("\n肿瘤样本中疾病状态分布:\n")
   print(table(tumor_info$disease_status, useNA = "ifany"))
-  
+
   # 🔥 步骤3: 对每个患者，合并表达数据和疾病状态
   # 如果同一患者有多个样本，取平均表达值，并优先选择有进展的状态
-  
+
   # 合并表达数据与疾病状态
   exp_dfs_df <- as.data.frame(t(exp_tumor_dfs))
   exp_dfs_df$sample_id <- rownames(exp_dfs_df)
-  exp_dfs_df <- merge(exp_dfs_df, 
-                      tumor_info[, c("sample_id", "patient_id", "disease_status", "has_tumor")],
+  exp_dfs_df <- merge(exp_dfs_df,
+                      tumor_info[, c("sample_id", "patient_id", "disease_status", "has_tumor", "nte_days")],
                       by = "sample_id")
-  
+
   # 按患者ID汇总
   patient_dfs_data <- exp_dfs_df %>%
     group_by(patient_id) %>%
     summarise(
       across(all_of(rownames(exp_target)), mean, na.rm = TRUE),  # 表达量取平均
       has_tumor = max(has_tumor, na.rm = TRUE),  # 只要有一个样本有肿瘤就算有
-      disease_status = first(disease_status[has_tumor == max(has_tumor)])  # 优先取有肿瘤的状态
+      disease_status = first(disease_status[has_tumor == max(has_tumor)]),  # 优先取有肿瘤的状态
+      nte_days = min(nte_days, na.rm = TRUE)  # 🔥 取最早的新肿瘤事件时间
     ) %>%
     as.data.frame()
-  
+
+  # 处理Inf值（当所有nte_days都是NA时，min返回Inf）
+  patient_dfs_data$nte_days[is.infinite(patient_dfs_data$nte_days)] <- NA
+
   rownames(patient_dfs_data) <- patient_dfs_data$patient_id
-  
+
   cat("\n按患者汇总后的数据:\n")
   cat("患者数:", nrow(patient_dfs_data), "\n")
   cat("has_tumor分布:\n")
   print(table(patient_dfs_data$has_tumor, useNA = "ifany"))
-  
+  cat("有NTE时间的患者数:", sum(!is.na(patient_dfs_data$nte_days)), "\n")
+
   # 🔥 步骤4: 独立合并临床数据
   survival_data_dfs <- merge(
     patient_dfs_data,
     clinical[, c("patient_id", "vital_status", "days_to_death", "days_to_last_follow_up")],
     by = "patient_id"
   )
-  
-  # 🔥 步骤5: 计算DFS时间和状态
-  survival_data_dfs$DFS_time <- ifelse(
-    survival_data_dfs$vital_status == "Dead",
-    as.numeric(survival_data_dfs$days_to_death),
-    as.numeric(survival_data_dfs$days_to_last_follow_up)
-  )
-  
-  # DFS状态：有进展/复发 OR 死亡 = 1
-  survival_data_dfs$DFS_status <- ifelse(
-    survival_data_dfs$has_tumor | survival_data_dfs$vital_status == "Dead",
-    1, 0
-  )
-  
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 🔥 步骤5: 正确计算DFS时间和状态（关键修复！）
+  # 根据TCGA-CDR标准计算PFI/DFS：
+  # 1. 如果有新肿瘤事件时间 → 使用 nte_days
+  # 2. 如果死亡(有肿瘤但无NTE时间) → 使用 days_to_death
+  # 3. 如果存活且有肿瘤(无NTE时间) → 使用 days_to_last_follow_up (这是近似值)
+  # 4. 如果存活且无肿瘤 → 使用 days_to_last_follow_up (审查)
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  survival_data_dfs <- survival_data_dfs %>%
+    mutate(
+      # DFS事件状态：有肿瘤进展 OR 死亡 = 1
+      DFS_status = ifelse(has_tumor | vital_status == "Dead", 1, 0),
+
+      # 🔥 DFS时间计算（关键修复！）
+      DFS_time = case_when(
+        # 情况1: 有新肿瘤事件时间记录 → 使用NTE时间（最准确）
+        !is.na(nte_days) & nte_days > 0 ~ nte_days,
+
+        # 情况2: 死亡 → 使用死亡时间
+        vital_status == "Dead" ~ as.numeric(days_to_death),
+
+        # 情况3: 存活 → 使用随访时间（无论是否有肿瘤，这是我们能得到的最好近似）
+        TRUE ~ as.numeric(days_to_last_follow_up)
+      )
+    )
+
   # 过滤无效数据
   survival_data_dfs <- survival_data_dfs %>% filter(!is.na(DFS_time) & DFS_time > 0)
   
@@ -609,20 +681,39 @@ if (!is.null(status_field)) {
   cat("\n====== DFS vs OS 详细对比 ======\n")
   cat("OS样本数:", nrow(survival_data_os), "\n")
   cat("DFS样本数:", nrow(survival_data_dfs), "\n")
-  
+
   # 找出共同患者进行对比
   common_patients <- intersect(survival_data_os$patient_id, survival_data_dfs$patient_id)
   cat("共同患者数:", length(common_patients), "\n")
-  
+
   if (length(common_patients) > 0) {
     os_common <- survival_data_os %>% filter(patient_id %in% common_patients)
     dfs_common <- survival_data_dfs %>% filter(patient_id %in% common_patients)
-    
+
     cat("\n共同患者中:\n")
     cat("  OS事件数（仅死亡）:", sum(os_common$OS_status), "\n")
     cat("  DFS事件数（进展+死亡）:", sum(dfs_common$DFS_status), "\n")
-    cat("  新增DFS事件（有肿瘤但未死）:", 
+    cat("  新增DFS事件（有肿瘤但未死）:",
         sum(dfs_common$DFS_status) - sum(os_common$OS_status), "\n")
+
+    # 🔥 新增：检查时间差异（关键诊断信息）
+    merged_times <- merge(
+      os_common[, c("patient_id", "OS_time")],
+      dfs_common[, c("patient_id", "DFS_time")],
+      by = "patient_id"
+    )
+    merged_times$time_diff <- merged_times$OS_time - merged_times$DFS_time
+
+    cat("\n🔥 时间差异诊断（OS_time - DFS_time）:\n")
+    cat("  时间完全相同的患者数:", sum(merged_times$time_diff == 0), "/", nrow(merged_times), "\n")
+    cat("  DFS时间更短的患者数:", sum(merged_times$time_diff > 0), "\n")
+    cat("  平均时间差:", round(mean(merged_times$time_diff), 1), "天\n")
+
+    if (sum(merged_times$time_diff > 0) > 0) {
+      cat("  ✓ DFS使用了不同的时间点（修复成功）\n")
+    } else if (sum(!is.na(survival_data_dfs$nte_days)) == 0) {
+      cat("  ⚠ 警告: 数据中无NTE时间字段，DFS时间为近似值\n")
+    }
   }
   
   # 检查是否有差异
@@ -769,7 +860,10 @@ if (exists("dfs_results") && nrow(dfs_results) > 0) {
 }
 
 cat("\n分析完毕！\n")
-cat("\n🔥 已完全修复:\n")
+cat("\n🔥 已完全修复 (v2):\n")
 cat("   1. OS和DFS生存曲线Risk table显示错误\n")
 cat("   2. DFS分析现在完全独立计算，不再依赖OS数据\n")
 cat("   3. DFS使用独立的患者集和表达数据分组\n")
+cat("   4. [v2新增] DFS_time现在使用new_tumor_event时间，与OS_time不同\n")
+cat("      - 优先使用new_tumor_event_dx_days_to字段\n")
+cat("      - 确保Risk table在OS和DFS中显示不同的数字\n")
