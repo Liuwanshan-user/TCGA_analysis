@@ -573,16 +573,39 @@ if (!is.null(dfs_status_field)) {
 
   # 步骤4: 识别有肿瘤进展的患者
   survival_data_dfs$disease_response <- survival_data_dfs[[dfs_status_field]]
+
+  # 识别各类疾病状态
   survival_data_dfs$has_tumor <- grepl("^WT|With Tumor", survival_data_dfs$disease_response, ignore.case = TRUE)
+  survival_data_dfs$is_tumor_free <- grepl("^TF|Tumor Free", survival_data_dfs$disease_response, ignore.case = TRUE)
+  survival_data_dfs$is_unknown <- is.na(survival_data_dfs$disease_response) |
+                                   grepl("Unknown|Not Reported", survival_data_dfs$disease_response, ignore.case = TRUE)
 
   cat("\n疾病状态分布:\n")
   print(table(survival_data_dfs$disease_response, useNA = "ifany"))
-  cat("\nhas_tumor分布:\n")
-  print(table(survival_data_dfs$has_tumor))
+  cat("\nhas_tumor (WT-With Tumor):", sum(survival_data_dfs$has_tumor), "\n")
+  cat("is_tumor_free (TF-Tumor Free):", sum(survival_data_dfs$is_tumor_free), "\n")
+  cat("is_unknown (Unknown/NA):", sum(survival_data_dfs$is_unknown), "\n")
 
-  # 步骤5: 计算DFS时间和状态
-  # DFS_time: 使用随访时间（与OS相同，因为没有精确的复发时间）
-  # DFS_status: 死亡=1 OR 有肿瘤=1
+  # 步骤5: 排除存活但疾病状态未知的患者
+  # 这些患者无法确定是否发生了进展事件，不能当作删失处理
+  n_before_filter <- nrow(survival_data_dfs)
+  excluded_patients <- survival_data_dfs %>%
+    filter(vital_status != "Dead" & is_unknown)
+
+  cat("\n⚠ 排除存活但疾病状态未知的患者:", nrow(excluded_patients), "例\n")
+  if (nrow(excluded_patients) > 0 && nrow(excluded_patients) <= 10) {
+    cat("排除的患者ID:", paste(excluded_patients$patient_id, collapse = ", "), "\n")
+  }
+
+  # 保留条件：死亡 OR (存活且疾病状态明确)
+  survival_data_dfs <- survival_data_dfs %>%
+    filter(vital_status == "Dead" | !is_unknown)
+
+  cat("过滤前样本数:", n_before_filter, "-> 过滤后:", nrow(survival_data_dfs), "\n")
+
+  # 步骤6: 计算PFS时间和状态
+  # PFS_time: 死亡用days_to_death，存活用days_to_last_follow_up
+  # PFS_status: 死亡=1 OR 有肿瘤进展=1
   survival_data_dfs$DFS_time <- ifelse(
     survival_data_dfs$vital_status == "Dead",
     as.numeric(survival_data_dfs$days_to_death),
@@ -593,7 +616,7 @@ if (!is.null(dfs_status_field)) {
     1, 0
   )
 
-  # 过滤无效数据
+  # 过滤无效时间数据
   survival_data_dfs <- survival_data_dfs %>% filter(!is.na(DFS_time) & DFS_time > 0)
 
   cat("\nDFS生存分析样本数:", nrow(survival_data_dfs), "\n")
